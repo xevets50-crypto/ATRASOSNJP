@@ -51,10 +51,15 @@ df.dropna(how="all", inplace=True)
 # =============================
 col_cliente = df.columns[15]
 
-df["cliente"] = df[col_cliente].astype(str).str.strip()
-df["cliente"] = df["cliente"].apply(
-    lambda x: x.split(" - ", 1)[1].upper() if " - " in x else x.upper()
+df["cliente"] = (
+    df[col_cliente]
+    .fillna("")
+    .astype(str)
+    .str.strip()
+    .str.upper()
 )
+
+df["cliente"] = df["cliente"].str.split(" - ", n=1).str[-1]
 
 # =============================
 # COLUNAS
@@ -69,23 +74,29 @@ def achar(nomes):
 col_unidade = achar(["receptora","filial"])
 col_cidade = achar(["cidade"])
 col_dias = achar(["dias"])
-col_local = achar(["localizacao"])
+col_local = achar(["localizacao","localização","local atual","status"])
 col_emissao = achar(["emissao"])
 
 # =============================
 # TRATAMENTO
 # =============================
-df["dias"] = pd.to_numeric(df[col_dias], errors="coerce").fillna(0)
+df["dias"] = pd.to_numeric(df[col_dias], errors="coerce").fillna(0) if col_dias else 0
 
-# Última ocorrência e atraso
+# Última ocorrência
 col_desc_ultima = achar(["descricao da ultima ocorrencia","descrição da ultima ocorrência"])
 if col_desc_ultima:
     df["ultima_ocorrencia_desc"] = df[col_desc_ultima].astype(str)
 else:
     df["ultima_ocorrencia_desc"] = ""
 
-# Entregue = CTRC ENTREGUE / BAIXADO
-df["entregue"] = df[col_local].astype(str).str.contains("CTRC ENTREGUE|BAIXADO", case=False, na=False)
+# Entregue
+if col_local:
+    df["entregue"] = df[col_local].astype(str).str.contains(
+        "CTRC ENTREGUE|BAIXADO", case=False, na=False
+    )
+else:
+    df["entregue"] = False
+
 df["atraso"] = (df["dias"] > 0) & (~df["entregue"])
 
 def status(d,a):
@@ -130,10 +141,14 @@ df_modelo["target"] = (df_modelo["dias"] >= 5).astype(int)
 X = df_modelo[["dias"]]
 y = df_modelo["target"]
 
-modelo = RandomForestClassifier(n_estimators=50, random_state=42)
-modelo.fit(X, y)
+if len(df_modelo) > 10 and df_modelo["target"].nunique() > 1:
+    modelo = RandomForestClassifier(n_estimators=50, random_state=42)
+    modelo.fit(X, y)
+    df["prob"] = modelo.predict_proba(X)[:,1]
+else:
+    df["prob"] = 0
 
-df["prob"] = modelo.predict_proba(X)[:,1]
+df["prob"] = df["prob"].fillna(0).clip(0,1)
 
 # =============================
 # PRIORIDADE
@@ -149,7 +164,9 @@ df["prioridade"] = df["score"].apply(
 c1,c2,c3 = st.columns(3)
 c1.metric("Total", len(df))
 c2.metric("Atrasos", int(df["atraso"].sum()))
-c3.metric("SLA", f"{((~df['atraso']).sum()/len(df)*100):.1f}%")
+
+sla_valor = ((~df['atraso']).sum()/len(df)*100) if len(df) > 0 else 0
+c3.metric("SLA", f"{sla_valor:.1f}%")
 
 st.divider()
 
@@ -246,17 +263,25 @@ st.altair_chart(grafico, width='stretch')
 # =============================
 st.subheader("📋 Acompanhamento")
 
-# FILTRA APENAS PENDENTES: localização atual não pode ter CTRC ENTREGUE / BAIXADO
-df_acomp = df[~df[col_local].astype(str).str.contains("CTRC ENTREGUE|BAIXADO", case=False, na=False)].copy()
+if col_local:
+    df_acomp = df[
+        ~df[col_local].astype(str).str.contains(
+            "CTRC ENTREGUE|BAIXADO", case=False, na=False
+        )
+    ].copy()
+else:
+    df_acomp = df.copy()
+
 df_acomp = df_acomp.sort_values(["score", "dias"], ascending=[False, False])
 
 tabela = pd.DataFrame()
 tabela["Remetente"] = df_acomp["cliente"]
 
-# Número da Nota Fiscal como segunda coluna, sem casas decimais
 col_nota = achar(["numero da nota fiscal","nota fiscal"])
 if col_nota:
-    tabela["Número da Nota Fiscal"] = df_acomp[col_nota].apply(lambda x: f"{int(x)}" if pd.notnull(x) else "")
+    tabela["Número da Nota Fiscal"] = df_acomp[col_nota].apply(
+        lambda x: str(int(float(x))) if pd.notnull(x) and str(x).replace('.','',1).isdigit() else ""
+    )
 
 tabela["Dias de Atraso"] = df_acomp["dias"].astype(int)
 tabela["Local Atual"] = df_acomp[col_local] if col_local else ""
@@ -272,7 +297,6 @@ if col_setor:
 tabela["Prioridade"] = df_acomp["prioridade"]
 tabela["Probabilidade (%)"] = (df_acomp["prob"]*100).round(1)
 
-# Destacar apenas "Dias de Atraso" de acordo com a prioridade
 def destacar_dias(s):
     cores = []
     for i, row in tabela.iterrows():
